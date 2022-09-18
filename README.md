@@ -1,5 +1,6 @@
 # Code-Pile 
 This repository contains the processing scripts to scrape/process the code-pile dataset.
+This project is very young, expect breaking changes.
 
 ## Table of Contents
 * Project Description
@@ -14,6 +15,12 @@ The Code-Pile will be released similar to "the pile" as a folder of .jsonl.zst f
 
 ## How to use the Code-Pile
 It's not finished, ask on discord
+
+cli prototype example (subject to change):
+```
+python -m codepile.codepile download config.json
+python -m codepile.codepile process config.json
+```
 
 ## How to Contribute
 Think about the most usefull Code-data for the next generation of textual Code Models. 
