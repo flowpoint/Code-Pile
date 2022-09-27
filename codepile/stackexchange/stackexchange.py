@@ -1,6 +1,8 @@
 import os
 import itertools
+from more_itertools import chunked
 from datetime import datetime
+from time import sleep
 
 import multiprocessing as mp
 
@@ -12,6 +14,26 @@ import urllib
 from functools import partial
 
 from codepile.dataset import DatasetInfo, DatasetSources, RawDataset, Scraper, Processor, Analyser, Dataset
+
+from lxml import etree
+
+from lm_dataformat import Archive
+import json
+import shutil
+
+import subprocess
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+
+from tqdm import tqdm
+from collections import defaultdict
+from copy import copy
+
+import gc
+import zstandard
 
 
 # todo
@@ -64,7 +86,8 @@ class Comment(BaseModel):
 
 
 class User(BaseModel):
-    user_id: str
+    user_id: int
+    displayname: str
     reputation: int
     upvotes: int
     downvotes: int
@@ -77,7 +100,7 @@ class User(BaseModel):
 class Post(BaseModel):
     # ids
     post_id: int
-    user_id: str
+    user_id: int
 
     # main post text
     title: str
@@ -99,22 +122,62 @@ class StackExchangeDoc(BaseModel):
     accepted_answer_post_id: int
     users: list[User]
 
+# key, python type, pyarrow type
+post_types = (
+    ('Id', int, pa.uint32),
+    ('OwnerUserId', int, pa.int32),
+    ('ParentId', int, pa.uint32),
+    ('PostTypeId', int, pa.uint8),
+    ('Score', int, pa.int32), # can be negative
+    ('Title', str, pa.large_string),
+    ('Body', str, pa.large_string),
+    ('Tags', str, pa.large_string),
+    ('FavoriteCount', int, pa.uint32),
+    ('CreationDate', datetime.fromisoformat, pa.date64),
+    ('LastEditDate', datetime.fromisoformat, pa.date64),
+    )
 
-def extract(output_dir, input_file):
-    input_file = input_file.replace('file://', '')
-    path = os.path.join(output_dir, os.path.basename(input_file))
+user_types = (
+    ('Id', int, pa.int32),
+    ('Reputation', int, pa.int32),
+    ('DisplayName', str, pa.large_string),
+    ('Views', int, pa.uint32),
+    ('UpVotes', int, pa.uint32),
+    ('DownVotes', int, pa.uint32),
+    ('AccountId', int, pa.int32),
+    ('ProfileImageUrl', str, pa.large_string),
 
-    with py7zr.SevenZipFile(input_file, mode='r') as z:
-        z.extractall(path=path)
+    ('CreationDate', datetime.fromisoformat, pa.date64),
+    ('LastAccessDate', datetime.fromisoformat, pa.date64),
+    )
+
+post_schema = pa.schema([(k,a()) for k,p,a in post_types])
+post_schema_python = {k:p for k,p,a in post_types}
+
+user_schema = pa.schema([(k,a()) for k,p,a in user_types])
+user_schema_python = {k:p for k,p,a in user_types}
+
+
+def parse_xml(source_xml, output_dirpath) -> dict :
+    # use lxml because pyarrow readxml has trouble with types
+    for event, element in etree.iterparse(source_xml, events=('end',), tag='row'):
+        j = dict(element.attrib)
+        yield j
+
+        # cleanup this element, and parents, to save memory
+        # https://stackoverflow.com/questions/7171140/using-python-iterparse-for-large-xml-files
+        element.clear(keep_tail=True)
+        while element.getprevious() is not None:
+            del element.getparent()[0]
 
 
 class StackExchangeCodeProcessor(Processor):
-    def process(self, raw_data: RawDataset, *args, **kwargs):
-        data_files = raw_data.storage_uris
-        data_files = list(filter(lambda x: x.endswith('.7z'), data_files))
-
-        # stackoverflow sites are spread over multiple 7z. files
-        stackoverflow_files = [
+    def __init__(self, *args, **kwargs):
+        #super().__init__(self, config, *args, **kwargs)
+        super().__init__(*args, **kwargs)
+        # files specific to stackoverflow
+        self.batch_size=100000
+        self.stackoverflow_files = [
                 'stackoverflow.com-Badges.7z',
                 'stackoverflow.com-Comments.7z',
                 'stackoverflow.com-PostHistory.7z',
@@ -125,80 +188,307 @@ class StackExchangeCodeProcessor(Processor):
                 'stackoverflow.com-Votes.7z'
                 ]
 
-        stackoverflow_data_uris = list(filter(
-                lambda x: os.path.basename(x) in stackoverflow_files,
-                data_files
-                ))
-
-        # remove the singular stackoverflow files
-        for u in stackoverflow_data_uris:
-            data_files.remove(u)
-
-        data_files = list(map(lambda x: [x], data_files))
-
-        # readd the stackoverflow files as a group
-        data_files.insert(0, stackoverflow_data_uris)
-
-        # parallel processing the subparts
-        # likely wanna sort, to process the biggest files first
-        # because processing can be sequential and linear with filesize
-        with mp.Pool(12) as p:
-            p.map(self.process_subdomain, uris[0:1], chunksize=1)
-
-    def process_subdomain(self, uris: list[str]):
-        assert isinstance(uris, list)
-
-        # handle the split stackoverflow files separately
-        if len(uris) > 1:
-            d = os.path.join(self.config.tmpdir, self.dataset_id, 'stackoverflow.com.7z')
-            os.makedirs(d, exist_ok=True)
-
-            def extract(inpath, outpath):
-                with py7zr.SevenZipFile(inpath, mode='r') as z:
-                    z.extractall(path=outpath)
-
-            uri = uri.replace('file://', '')
-            input_files = [uri.replace('file://', '') for uri in uris]
-
-            output_dir = os.path.join(dirpath, os.path.basename(uri))
-
-            # extract is a separate funcion because of pickeling
-            # parallel because zip is single core and slow
-            with mp.Pool(12) as p:
-                p.map(partial(extract, output_dir), input_files, chunksize=1)
-
-        else:
-            uri = uris[0]
-            uri = uri.replace('file://', '')
-            d = os.path.join(self.config.tmpdir, self.dataset_id, os.path.basename(uri))
-            os.makedirs(d, exist_ok=True)
-
-            with py7zr.SevenZipFile(uri, mode='r') as z:
-                z.extractall(path=os.path.join(d, os.path.basename(uri)))
-
-
-        files = [
-                'Badges.xml',
-                'Comments.xml',
-                'PostHistory.xml',
-                'PostLinks.xml',
+        # the all files present in the dump for each subdomain
+        # select the tables that we're interested in
+        self.target_files = [
+                #'Badges.xml',
+                #'Comments.xml',
+                #'PostHistory.xml',
+                #'PostLinks.xml',
                 'Posts.xml',
-                'Tags.xml',
+                #'Tags.xml',
                 'Users.xml',
-                'Votes.xml',
+                #'Votes.xml',
                 ]
 
-        # verify
-        for subdomain in os.listdir(os.path.join(self.config.tmpdir, self.dataset_id)):
-            if not subdomain.endswith(".7z"):
-                continue
-            else:
-                for f in files:
-                    p = os.path.join(self.config.tmpdir, self.dataset_id, subdomain))
-                    assert f in os.listdir(p), \
-                            f'file: {f} missing in folder {p} \
-                            during processing stackexchange subdomain'
+        self.target_schema_python = {
+                'Users.xml': user_schema_python,
+                'Posts.xml': post_schema_python
+                }
 
+        self.target_schema = {
+                'Users.xml': user_schema,
+                'Posts.xml': post_schema
+                #'Comments.xml',
+                }
+
+    def save_to_jsonl(self, dict_):
+        raise NotImplementedError
+
+    def format(self, dict_) -> dict:
+        raise NotImplementedError
+
+
+    def join_and_export(self, domain: str, postsfile, disk_offload=True):
+        # the max ram consumption is 2x the biggest table
+        # because we want to sort the table fast with pyarrow
+        # and it requires 2x because of immutability
+
+        # save the tables to disk, to temporarily free the ram
+
+        def save_table(table, path, batch_size):
+            # saving it this way, because the higher level dataset api
+            # doesn't keep the order during saving or loading
+            with pa.OSFile(path, 'wb') as sink:
+                with pa.ipc.new_file(sink, table.schema) as writer:
+                    for batch in table.to_batches(max_chunksize=batch_size):
+                        writer.write_batch(batch)
+
+        def stream_rows_from_disk(path):
+            #with pa.memory_map(os.path.join(output_dirpath, 'sorted_answers.arrow'), 'rb') as source:
+            with pa.OSFile(path, 'rb') as source:
+                source_stream = pa.ipc.open_file(source)
+                for bi in range(source_stream.num_record_batches):
+                    batch = source_stream.get_batch(bi)#.read_all()
+                    for row in batch.to_pylist():
+                        yield row
+
+        def stream_rows(table):
+            for batch in table.to_batches():
+                for row in batch.to_pylist():
+                    yield row
+
+        output_dirpath = os.path.join(self.config.tmpdir, self.dataset_id, domain)
+            
+        print('joining users and posts')
+        posts_w_users_path = os.path.join(output_dirpath, 'Posts_w_Users.arrow')
+        if not os.path.isfile(posts_w_users_path):
+            postsds = ds.dataset(os.path.join(output_dirpath, 'Posts.arrow'), format='arrow')
+            usersds = ds.dataset(os.path.join(output_dirpath, 'Users.arrow'), format='arrow')
+
+            # note there are deleted users with a negative userid
+            # todo
+            # remove columns, because they crash pyarrow currently
+
+            # this combination of dataset uses less ram than joining both as tables
+            users_table = ds.dataset(usersds.to_table(columns=['Id', 'Reputation', 'Views', 'UpVotes', 'DownVotes', "AccountId", 'CreationDate']))
+            print(usersds.schema)
+            posts_w_users = postsds.join(users_table, keys='OwnerUserId', right_keys='Id', left_suffix='post', right_suffix='user').to_table(batch_size=self.batch_size)
+            print(type(posts_w_users))
+
+            if disk_offload:
+                save_table(posts_w_users, 
+                        posts_w_users_path,
+                        batch_size=self.batch_size)
+
+            #ds.write_dataset(postscds = 
+
+            if disk_offload:
+                del posts_w_users
+            del users_table
+            del usersds
+            gc.collect()
+
+
+        print('loading users and posts')
+        posts_w_usersds = ds.dataset(posts_w_users_path, format='arrow')
+
+        is_question = pc.field('PostTypeId') == 1
+        is_answer = pc.field('PostTypeId') == 2
+
+        # this specific way, we don't have to load the full postsds
+        # the tables still run in memory
+        # because pyarrow doesn't yet support sorting datasets on disk
+        print('loading questions')
+        question_path = os.path.join(output_dirpath, 'sorted_questions.arrow')
+        if not os.path.isfile(question_path):
+            question_table = posts_w_usersds.to_table(
+                filter=is_question)
+
+            print('sorting questions')
+            sorted_questions = question_table.sort_by([('Id', 'ascending')])
+            del question_table
+            gc.collect()
+            print('saving questions')
+
+            if disk_offload:
+                save_table(sorted_questions, question_path, self.batch_size)
+                del sorted_questions
+                gc.collect()
+
+        print('loading answers')
+        answer_path = os.path.join(output_dirpath, 'sorted_answers.arrow')
+        if not os.path.isfile(answer_path):
+            answer_table = posts_w_usersds.to_table(
+                filter=is_answer)
+
+            print('sorting answers')
+            sorted_answers = answer_table.sort_by([('ParentId','ascending')])
+            del answer_table
+            gc.collect()
+            print('saving answers')
+
+            if disk_offload:
+                save_table(sorted_answers, answer_path, self.batch_size)
+                del sorted_answers
+                gc.collect()
+
+        if disk_offload:
+            question_iter = stream_rows_from_disk(question_path)
+            answer_iter = stream_rows_from_disk(answer_path)
+        else:
+            question_iter = stream_rows(sorted_questions)
+            answer_iter = stream_rows(sorted_answers)
+
+        a = next(answer_iter)
+        appended = 0
+
+        for q in tqdm(question_iter):#sorted_questions.to_batches(batch_size=1):
+            result = dict()
+            result['question'] = q
+            result['answers'] = []
+            while 1:
+                assert q['Id'] <= a['ParentId'], f'question id not smaller than answer parent id, something broke, question: {q} \nanswer: {a} '
+                if q['Id'] == a['ParentId']:
+                    result['answers'] = result['answers'] + [a]
+                    appended += 1
+                    try:
+                        a = next(answer_iter)
+                    except StopIteration:
+                        break
+                else:
+                    break
+
+            formatted = self.format(result)
+            self.save_to_jsonl(formatted)
+            #print(appended)
+
+
+
+    def process(self, raw_data: RawDataset, *args, **kwargs):
+        data_files = raw_data.storage_uris
+        data_files = list(filter(lambda x: x.endswith('.7z'), data_files))
+
+        def get_domain(x):
+            fname = os.path.basename(x)
+            if fname in self.stackoverflow_files:
+                domain = 'stackoverflow.com'
+            else:
+                domain = fname.replace('.7z', '')
+            return domain
+
+        def group_by_domain(data_files):
+            g = dict()
+            for k, v in itertools.groupby(
+                    sorted(data_files, key=get_domain), 
+                    key=get_domain
+                    ):
+                # warning, itertools shares the iterator
+                # so listing the grouper v consumes the values
+                # use vals or g for further computation on the group
+                vals = list(v)
+                g[k] = vals
+
+            return g
+
+
+        g = group_by_domain(data_files)
+        parallel = True
+        async_results = dict()
+        print('running parallel processing')
+        with mp.Pool() as p:
+            # extract all the needed dumps
+            for domain, dumps in g.items():
+                async_results[domain] = dict()
+                for dump in dumps:
+                    # todo process other domains too
+                    if domain == 'stackoverflow.com':
+                        if parallel:
+                            c = p.apply_async(self.extract_dumpfile, (domain, dump))
+                            async_results[domain][dump] = c
+                        else:
+                            self.extract_dumpfile(domain, file)
+
+
+            # wait and then transcode to arrow
+            for domain in g.keys():
+                if domain == 'stackoverflow.com':
+                    # wait until all domain targets are extracted
+                    for dump, result in async_results[domain].items():
+                        result.wait()
+                        assert result.successful()
+
+                    # queue transcoding to intermediate format
+                    for target in self.target_files:
+                        self.save_intermediate(domain, target)
+
+
+            # join tables to dicts
+            for domain in g.keys():
+                if domain == 'stackoverflow.com':
+                    # queue transcoding to intermediate format
+                    for target in self.target_files:
+                        self.join_and_export(domain, target)
+
+
+    def extract_dumpfile(self, domain: str, input_uri: str):
+        dataset_tmpdir = os.path.join(self.config.tmpdir, self.dataset_id)
+        input_filepath = input_uri.replace('file://', '')
+        input_filename = os.path.basename(input_filepath)
+
+        output_dirpath = os.path.join(dataset_tmpdir, domain)
+        os.makedirs(output_dirpath, exist_ok=True)
+
+
+        # move stackoverflow target file to output_dirpath
+        if domain == 'stackoverflow.com':
+            target = input_filename.replace('stackoverflow.com-', '').replace('.7z', '.xml')
+            # skip if already present
+            if os.path.isfile(os.path.join(output_dirpath, target)):
+                return
+
+            if target in self.target_files:
+                with py7zr.SevenZipFile(input_filepath, mode='r') as z:
+                    z.extractall(path=output_dirpath)
+
+        else:
+            # skip if already present
+            if os.path.isdir(output_dirpath):
+                return
+
+            # all targets are in the same zip, so we unzip
+            with py7zr.SevenZipFile(input_filepath, mode='r') as z:
+                z.extractall(path=output_dirpath)
+
+
+    def save_intermediate(self, domain: str, target: str):
+        output_dirpath = os.path.join(self.config.tmpdir, self.dataset_id, domain)
+        target_path = os.path.join(output_dirpath, target.replace('.xml', '.arrow'))
+        if os.path.isfile(target_path):
+            return
+
+        # todo
+        schema = self.target_schema[target]
+        schema_python = self.target_schema_python[target]
+
+        # note, this drops values that arent int the schema
+        def cast_dict_to_schema(schema, data: dict):
+            d = dict()
+            for k, type_ in schema.items():
+                if k in data:
+                    d[k] = type_(data[k])
+                else:
+                    d[k] = None
+            return d
+
+        with pa.OSFile(target_path, 'wb') as sink:
+            with pa.ipc.new_file(sink, schema) as writer:
+                xml_parse_stream = parse_xml(
+                        os.path.join(output_dirpath, target), 
+                        output_dirpath, 
+                        )
+
+                corrected_types_steam = map(
+                        partial(cast_dict_to_schema, schema_python),
+                        xml_parse_stream)
+
+                chunked_stream = chunked(corrected_types_steam, self.batch_size)
+                for chunk in tqdm(chunked_stream):
+                    batch = pa.RecordBatch.from_pylist(
+                            chunk,
+                            schema=schema)
+
+                    writer.write_batch(batch)
 
 
 class StackExchangeDataset(Dataset):
@@ -206,14 +496,6 @@ class StackExchangeDataset(Dataset):
         self.config = config
         self.scraper = StackExchangeScraper(self.config, self.id)
         self.processor = StackExchangeCodeProcessor(self.config, self.id)
-
-    '''
-    def download(self, *args, **kwargs):
-        return super().download()
-
-    def process(self, *args, **kwargs):
-        return super().process()
-    '''
 
     @property
     def info(self):

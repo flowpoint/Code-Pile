@@ -11,5 +11,7 @@ dependencies = [
     "pydantic",
     "internetarchive",
     "py7zr",
-    "more_itertools"
+    "more_itertools",
+    "pandas",
+    "pyarrow"
 ]
