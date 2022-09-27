@@ -16,6 +16,7 @@ import py7zr
 
 from codepile.dataset import DatasetInfo, DatasetSources, RawDataset, Scraper, Processor, Analyser, Dataset
 
+
 # todo
 STACKEXCHANGEINFO = DatasetInfo(
         id='StackExchange',
@@ -23,7 +24,7 @@ STACKEXCHANGEINFO = DatasetInfo(
         data_end=datetime(2022,1,1),
         data_start=10,
         size=10,
-        storage_format='tar',
+        storage_format='.jsonl.zst',
         #storage_uri='/root',
         cpu_hours=1,
         gpu_hours=1,
@@ -57,8 +58,23 @@ class StackExchangeScraper(Scraper):
         ds = RawDataset(storage_uris=storage_uris, metadata=str(metadata))
         return ds
 
+
+def parse_xml(source_xml, output_dirpath) -> dict :
+    # use lxml because pyarrow readxml has trouble with types
+    for event, element in etree.iterparse(source_xml, events=('end',), tag='row'):
+        j = dict(element.attrib)
+        yield j
+
+        # cleanup this element, and parents, to save memory
+        # https://stackoverflow.com/questions/7171140/using-python-iterparse-for-large-xml-files
+        element.clear(keep_tail=True)
+        while element.getprevious() is not None:
+            del element.getparent()[0]
+
+
 class StackExchangeCodeProcessor(Processor):
     def __init__(self, *args, **kwargs):
+        #super().__init__(self, config, *args, **kwargs)
         super().__init__(*args, **kwargs)
         # files specific to stackoverflow
         self.batch_size=100000
@@ -86,32 +102,97 @@ class StackExchangeCodeProcessor(Processor):
                 #'Votes.xml',
                 ]
 
-        self.target_schema_python = {
-                'Users.xml': user_schema_python,
-                'Posts.xml': post_schema_python
-                }
-
-        self.target_schema = {
-                'Users.xml': user_schema,
-                'Posts.xml': post_schema
-                #'Comments.xml',
-                }
-
     def save_to_jsonl(self, dict_):
         raise NotImplementedError
 
     def format(self, dict_) -> dict:
         raise NotImplementedError
 
-    def process(self, raw_data: RawDataset, *args, **kwargs):
+    def join_and_export(self, domain: str, postsfile, disk_offload=True):
         raise NotImplementedError
+
+    def process(self, raw_data: RawDataset, *args, **kwargs):
+        data_files = raw_data.storage_uris
+        data_files = list(filter(lambda x: x.endswith('.7z'), data_files))
+
+        def get_domain(x):
+            fname = os.path.basename(x)
+            if fname in self.stackoverflow_files:
+                domain = 'stackoverflow.com'
+            else:
+                domain = fname.replace('.7z', '')
+            return domain
+
+        def group_by_domain(data_files):
+            g = dict()
+            for k, v in itertools.groupby(
+                    sorted(data_files, key=get_domain), 
+                    key=get_domain
+                    ):
+                # warning, itertools shares the iterator
+                # so listing the grouper v consumes the values
+                # use vals or g for further computation on the group
+                vals = list(v)
+                g[k] = vals
+
+            return g
+
+
+        g = group_by_domain(data_files)
+        parallel = True
+        #parallel = False
+        async_results = dict()
+        print('running parallel processing')
+        with mp.Pool() as p:
+            # extract all the needed dumps
+            for domain, dumps in g.items():
+                async_results[domain] = dict()
+                for dump in dumps:
+                    if parallel:
+                        c = p.apply_async(self.extract_dumpfile, (domain, dump))
+                        async_results[domain][dump] = c
+                    else:
+                        self.extract_dumpfile(domain, dump)
+
+
+            # wait and then transcode to arrow
+            for domain in g.keys():
+                # wait until all domain targets are extracted
+                for dump, result in async_results[domain].items():
+                    result.wait()
+                    assert result.successful()
 
 
     def extract_dumpfile(self, domain: str, input_uri: str):
-        raise NotImplementedError
+        print(f'extracting {domain} {input_uri}')
+        dataset_tmpdir = os.path.join(self.config.tmpdir, self.dataset_id)
+        input_filepath = input_uri.replace('file://', '')
+        input_filename = os.path.basename(input_filepath)
 
-    def save_intermediate(self, domain: str, target: str):
-        raise NotImplementedError
+        output_dirpath = os.path.join(dataset_tmpdir, domain)
+
+        # move stackoverflow target file to output_dirpath
+        if domain == 'stackoverflow.com':
+            os.makedirs(output_dirpath, exist_ok=True)
+            target = input_filename.replace('stackoverflow.com-', '').replace('.7z', '.xml')
+            # skip if already present
+            if os.path.isfile(os.path.join(output_dirpath, target)):
+                return
+
+            if target in self.target_files:
+                with py7zr.SevenZipFile(input_filepath, mode='r') as z:
+                    z.extractall(path=output_dirpath)
+
+        else:
+            # skip if already present
+            if os.path.isdir(output_dirpath):
+                return
+
+            os.makedirs(output_dirpath, exist_ok=True)
+            # all targets are in the same zip, so we unzip
+            with py7zr.SevenZipFile(input_filepath, mode='r') as z:
+                z.extractall(path=output_dirpath)
+
 
 class StackExchangeDataset(Dataset):
     def __init__(self, config, *args, **kwargs):
