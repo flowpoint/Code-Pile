@@ -205,17 +205,29 @@ class StackExchangeCodeProcessor(Processor):
                     else:
                         self.extract_dumpfile(domain, dump)
 
-
-            # wait and then transcode to arrow
+            # wait 
             for domain in g.keys():
                 # wait until all domain targets are extracted
                 for dump, result in async_results[domain].items():
                     result.wait()
                     assert result.successful()
 
-                 # queue transcoding to intermediate format
-                for target in self.target_files:
-                    self.save_intermediate(domain, target)
+        gc.collect()
+
+        # transcode to arrow
+        for domain in g.keys():
+             # queue transcoding to intermediate format
+            for target in self.target_files:
+                self.save_intermediate(domain, target)
+                gc.collect()
+
+        # join tables to dicts
+        for domain in g.keys():
+            # queue transcoding to intermediate format
+            self.join_and_export(domain, target)
+            gc.collect()
+            
+        print('done')
 
 
     def extract_dumpfile(self, domain: str, input_uri: str):
@@ -286,6 +298,142 @@ class StackExchangeCodeProcessor(Processor):
                             schema=schema)
 
                     writer.write_batch(batch)
+
+    def join_and_export(self, domain: str, disk_offload=True):
+        # the max ram consumption is 2x the biggest table
+        # because we want to sort the table fast with pyarrow
+        # and it requires 2x because of immutability
+
+        # save the tables to disk, to temporarily free the ram
+
+        def save_table(table, path, batch_size):
+            # saving it this way, because the higher level dataset api
+            # doesn't keep the order during saving or loading
+            print(f'saving {path}')
+            with pa.OSFile(path, 'wb') as sink:
+                with pa.ipc.new_file(sink, table.schema) as writer:
+                    for batch in table.to_batches(max_chunksize=batch_size):
+                        writer.write_batch(batch)
+
+        def stream_rows_from_disk(path):
+            #with pa.memory_map(os.path.join(output_dirpath, 'sorted_answers.arrow'), 'rb') as source:
+            with pa.OSFile(path, 'rb') as source:
+                source_stream = pa.ipc.open_file(source)
+                for bi in range(source_stream.num_record_batches):
+                    batch = source_stream.get_batch(bi)#.read_all()
+                    for row in batch.to_pylist():
+                        yield row
+
+        def stream_rows(table):
+            for batch in table.to_batches():
+                for row in batch.to_pylist():
+                    yield row
+
+        output_dirpath = os.path.join(self.config.tmpdir, self.dataset_id, domain)
+            
+        print(f'joining users and posts of {domain}')
+        posts_w_users_path = os.path.join(output_dirpath, 'Posts_w_Users.arrow')
+        if not os.path.isfile(posts_w_users_path):
+            postsds = ds.dataset(os.path.join(output_dirpath, 'Posts.arrow'), format='arrow')
+            usersds = ds.dataset(os.path.join(output_dirpath, 'Users.arrow'), format='arrow')
+
+            # note there are deleted users with a negative userid
+            # todo
+            # remove columns, because they crash pyarrow currently
+
+            # this combination of dataset uses less ram than joining both as tables
+            users_table = ds.dataset(usersds.to_table(columns=['Id', 'Reputation', 'Views', 'UpVotes', 'DownVotes', "AccountId", 'CreationDate']))
+            print(f'joining posts_w_usrs {domain}')
+            posts_w_users = postsds.join(users_table, keys='OwnerUserId', right_keys='Id', left_suffix='post', right_suffix='user').to_table(batch_size=self.batch_size)
+
+            if disk_offload:
+                save_table(posts_w_users, 
+                        posts_w_users_path,
+                        batch_size=self.batch_size)
+
+            #ds.write_dataset(postscds = 
+
+            if disk_offload:
+                del posts_w_users
+            del users_table
+            del usersds
+            gc.collect()
+
+
+        print('loading users and posts')
+        posts_w_usersds = ds.dataset(posts_w_users_path, format='arrow')
+
+        is_question = pc.field('PostTypeId') == 1
+        is_answer = pc.field('PostTypeId') == 2
+
+        # this specific way, we don't have to load the full postsds
+        # the tables still run in memory
+        # because pyarrow doesn't yet support sorting datasets on disk
+        print('loading questions')
+        question_path = os.path.join(output_dirpath, 'sorted_questions.arrow')
+        if not os.path.isfile(question_path):
+            question_table = posts_w_usersds.to_table(
+                filter=is_question)
+
+            print('sorting questions')
+            sorted_questions = question_table.sort_by([('Id', 'ascending')])
+            del question_table
+            gc.collect()
+            print('saving questions')
+
+            if disk_offload:
+                save_table(sorted_questions, question_path, self.batch_size)
+                del sorted_questions
+                gc.collect()
+
+        print('loading answers')
+        answer_path = os.path.join(output_dirpath, 'sorted_answers.arrow')
+        if not os.path.isfile(answer_path):
+            answer_table = posts_w_usersds.to_table(
+                filter=is_answer)
+
+            print('sorting answers')
+            sorted_answers = answer_table.sort_by([('ParentId','ascending')])
+            del answer_table
+            gc.collect()
+            print('saving answers')
+
+            if disk_offload:
+                save_table(sorted_answers, answer_path, self.batch_size)
+                del sorted_answers
+                gc.collect()
+
+        if disk_offload:
+            question_iter = stream_rows_from_disk(question_path)
+            answer_iter = stream_rows_from_disk(answer_path)
+        else:
+            question_iter = stream_rows(sorted_questions)
+            answer_iter = stream_rows(sorted_answers)
+
+        a = next(answer_iter)
+        appended = 0
+
+        print(f'iterating: {domain}')
+        for q in tqdm(question_iter):
+            result = dict()
+            result['question'] = q
+            result['answers'] = []
+            #print(q['Id'])
+            while 1:
+                assert q['Id'] <= a['ParentId'], f'question id not smaller than answer parent id, something broke, question: {q} \nanswer: {a} '
+                if q['Id'] == a['ParentId']:
+                    result['answers'] = result['answers'] + [a]
+                    appended += 1
+                    try:
+                        a = next(answer_iter)
+                    except StopIteration:
+                        return
+                else:
+                    break
+
+            #formatted = self.format(result)
+            #self.save_to_jsonl(formatted)
+            #print(appended)
 
 
 class StackExchangeDataset(Dataset):
