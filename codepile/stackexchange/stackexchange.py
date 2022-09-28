@@ -417,30 +417,43 @@ class StackExchangeDataset(Dataset):
     @property
     def info(self):
         # todo
+        description = '''a question answer dataset of all stackexchange sites.
+        every sample consists of a question, a list of answers and users tht asked or answered, with additional metadata.
+        the data is obtained through the stackoverflow internet archive dump.
+
+        for more information about the dump, see the dumps data schema here:
+        
+        https://meta.stackexchange.com/questions/2677/database-schema-documentation-for-the-public-data-dump-and-sede
+        '''
+
+
+        # todo
+
         STACKEXCHANGEINFO = DatasetInfo(
                 id='StackExchange',
-                description='',
-                data_end=datetime(2022,1,1),
-                data_start=10,
-                size=10,
+                description=description,
+                data_end=datetime(2022,06,06),
+                data_start=datetime(2014,01,21),
+                size=-1,
                 storage_format='.jsonl.zst',
                 #storage_uri='/root',
-                cpu_hours=1,
-                gpu_hours=1,
-                ram_requirements=1,
-                tempfile_requirement=1,
+                cpu_hours=-1,
+                gpu_hours=0,
+                # 128GB in bits
+                ram_requirements=1024000000000,
+                # 550GB in bits disk
+                tempfile_requirement=4400000000000,
                 source_uri='https://archive.org/details/stackexchange',
-                dataset_pros='l',
-                dataset_cons='l',
+                dataset_pros='',
+                dataset_cons='',
                 languages=[''],
                 coding_languages=[''],
-                modalities=['discussion'],
-                source_license='gpl',
-                source_citation='this',
-                data_owner='me',
-                contributers=['me']
+                modalities=['question/answer'],
+                source_license='CC BY-SA 4.0',
+                source_citation='',
+                data_owner='flowpoint',
+                contributers=['vangap']
                 )
-
 
         return STACKEXCHANGEINFO
 
