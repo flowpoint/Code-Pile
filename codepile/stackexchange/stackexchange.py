@@ -22,31 +22,6 @@ import pyarrow.dataset as ds
 from codepile.dataset import DatasetInfo, DatasetSources, RawDataset, Scraper, Processor, Analyser, Dataset
 
 
-# todo
-STACKEXCHANGEINFO = DatasetInfo(
-        id='StackExchange',
-        description='',
-        data_end=datetime(2022,1,1),
-        data_start=10,
-        size=10,
-        storage_format='.jsonl.zst',
-        #storage_uri='/root',
-        cpu_hours=1,
-        gpu_hours=1,
-        ram_requirements=1,
-        tempfile_requirement=1,
-        source_uri='https://archive.org/details/stackexchange',
-        dataset_pros='l',
-        dataset_cons='l',
-        languages=[''],
-        coding_languages=[''],
-        modalities=['discussion'],
-        source_license='gpl',
-        source_citation='this',
-        data_owner='me',
-        contributers=['me']
-        )
-
 
 class StackExchangeScraper(Scraper):
     def scrape(self) -> RawDataset:
@@ -62,54 +37,6 @@ class StackExchangeScraper(Scraper):
             ))
         ds = RawDataset(storage_uris=storage_uris, metadata=str(metadata))
         return ds
-
-
-def parse_xml(source_xml, output_dirpath) -> dict :
-    # use lxml because pyarrow readxml has trouble with types
-    for event, element in etree.iterparse(source_xml, events=('end',), tag='row'):
-        j = dict(element.attrib)
-        yield j
-
-        # cleanup this element, and parents, to save memory
-        # https://stackoverflow.com/questions/7171140/using-python-iterparse-for-large-xml-files
-        element.clear(keep_tail=True)
-        while element.getprevious() is not None:
-            del element.getparent()[0]
-
-# key, python type, pyarrow type
-post_types = (
-    ('Id', int, pa.uint32),
-    ('OwnerUserId', int, pa.int32),
-    ('ParentId', int, pa.uint32),
-    ('PostTypeId', int, pa.uint8),
-    ('Score', int, pa.int32), # can be negative
-    ('Title', str, pa.large_string),
-    ('Body', str, pa.large_string),
-    ('Tags', str, pa.large_string),
-    ('FavoriteCount', int, pa.uint32),
-    ('CreationDate', datetime.fromisoformat, pa.date64),
-    ('LastEditDate', datetime.fromisoformat, pa.date64),
-    )
-
-user_types = (
-    ('Id', int, pa.int32),
-    ('Reputation', int, pa.int32),
-    ('DisplayName', str, pa.large_string),
-    ('Views', int, pa.uint32),
-    ('UpVotes', int, pa.uint32),
-    ('DownVotes', int, pa.uint32),
-    ('AccountId', int, pa.int32),
-    ('ProfileImageUrl', str, pa.large_string),
-
-    ('CreationDate', datetime.fromisoformat, pa.date64),
-    ('LastAccessDate', datetime.fromisoformat, pa.date64),
-    )
-
-post_schema = pa.schema([(k,a()) for k,p,a in post_types])
-post_schema_python = {k:p for k,p,a in post_types}
-
-user_schema = pa.schema([(k,a()) for k,p,a in user_types])
-user_schema_python = {k:p for k,p,a in user_types}
 
 
 class StackExchangeCodeProcessor(Processor):
@@ -142,6 +69,41 @@ class StackExchangeCodeProcessor(Processor):
                 #'Votes.xml',
                 ]
 
+        # key, python type, pyarrow type
+        post_types = (
+            ('Id', int, pa.uint32),
+            ('OwnerUserId', int, pa.int32),
+            ('ParentId', int, pa.uint32),
+            ('PostTypeId', int, pa.uint8),
+            ('Score', int, pa.int32), # can be negative
+            ('Title', str, pa.large_string),
+            ('Body', str, pa.large_string),
+            ('Tags', str, pa.large_string),
+            ('FavoriteCount', int, pa.uint32),
+            ('CreationDate', datetime.fromisoformat, pa.date64),
+            ('LastEditDate', datetime.fromisoformat, pa.date64),
+            )
+
+        user_types = (
+            ('Id', int, pa.int32),
+            ('Reputation', int, pa.int32),
+            ('DisplayName', str, pa.large_string),
+            ('Views', int, pa.uint32),
+            ('UpVotes', int, pa.uint32),
+            ('DownVotes', int, pa.uint32),
+            ('AccountId', int, pa.int32),
+            ('ProfileImageUrl', str, pa.large_string),
+
+            ('CreationDate', datetime.fromisoformat, pa.date64),
+            ('LastAccessDate', datetime.fromisoformat, pa.date64),
+            )
+
+        post_schema = pa.schema([(k,a()) for k,p,a in post_types])
+        post_schema_python = {k:p for k,p,a in post_types}
+
+        user_schema = pa.schema([(k,a()) for k,p,a in user_types])
+        user_schema_python = {k:p for k,p,a in user_types}
+
         self.target_schema_python = {
                 'Users.xml': user_schema_python,
                 'Posts.xml': post_schema_python
@@ -157,9 +119,6 @@ class StackExchangeCodeProcessor(Processor):
         raise NotImplementedError
 
     def format(self, dict_) -> dict:
-        raise NotImplementedError
-
-    def join_and_export(self, domain: str, postsfile, disk_offload=True):
         raise NotImplementedError
 
     def process(self, raw_data: RawDataset, *args, **kwargs):
@@ -223,11 +182,26 @@ class StackExchangeCodeProcessor(Processor):
 
         # join tables to dicts
         for domain in g.keys():
+            # only need to offload the biggest domains
+            disk_offload = domain == 'stackoverflow.com'
             # queue transcoding to intermediate format
-            self.join_and_export(domain, target)
+            self.join_and_export(domain, disk_offload)
             gc.collect()
             
         print('done')
+
+
+    def parse_xml(self, source_xml, output_dirpath) -> dict :
+        # use lxml because pyarrow readxml has trouble with types
+        for event, element in etree.iterparse(source_xml, events=('end',), tag='row'):
+            j = dict(element.attrib)
+            yield j
+
+            # cleanup this element, and parents, to save memory
+            # https://stackoverflow.com/questions/7171140/using-python-iterparse-for-large-xml-files
+            element.clear(keep_tail=True)
+            while element.getprevious() is not None:
+                del element.getparent()[0]
 
 
     def extract_dumpfile(self, domain: str, input_uri: str):
@@ -282,7 +256,7 @@ class StackExchangeCodeProcessor(Processor):
 
         with pa.OSFile(target_path, 'wb') as sink:
             with pa.ipc.new_file(sink, schema) as writer:
-                xml_parse_stream = parse_xml(
+                xml_parse_stream = self.parse_xml(
                         os.path.join(output_dirpath, target), 
                         output_dirpath, 
                         )
@@ -351,8 +325,6 @@ class StackExchangeCodeProcessor(Processor):
                         posts_w_users_path,
                         batch_size=self.batch_size)
 
-            #ds.write_dataset(postscds = 
-
             if disk_offload:
                 del posts_w_users
             del users_table
@@ -371,7 +343,7 @@ class StackExchangeCodeProcessor(Processor):
         # because pyarrow doesn't yet support sorting datasets on disk
         print('loading questions')
         question_path = os.path.join(output_dirpath, 'sorted_questions.arrow')
-        if not os.path.isfile(question_path):
+        if not os.path.isfile(question_path) or not disk_offload:
             question_table = posts_w_usersds.to_table(
                 filter=is_question)
 
@@ -388,7 +360,7 @@ class StackExchangeCodeProcessor(Processor):
 
         print('loading answers')
         answer_path = os.path.join(output_dirpath, 'sorted_answers.arrow')
-        if not os.path.isfile(answer_path):
+        if not os.path.isfile(answer_path) or not disk_offload:
             answer_table = posts_w_usersds.to_table(
                 filter=is_answer)
 
@@ -444,6 +416,32 @@ class StackExchangeDataset(Dataset):
 
     @property
     def info(self):
+        # todo
+        STACKEXCHANGEINFO = DatasetInfo(
+                id='StackExchange',
+                description='',
+                data_end=datetime(2022,1,1),
+                data_start=10,
+                size=10,
+                storage_format='.jsonl.zst',
+                #storage_uri='/root',
+                cpu_hours=1,
+                gpu_hours=1,
+                ram_requirements=1,
+                tempfile_requirement=1,
+                source_uri='https://archive.org/details/stackexchange',
+                dataset_pros='l',
+                dataset_cons='l',
+                languages=[''],
+                coding_languages=[''],
+                modalities=['discussion'],
+                source_license='gpl',
+                source_citation='this',
+                data_owner='me',
+                contributers=['me']
+                )
+
+
         return STACKEXCHANGEINFO
 
     @property
