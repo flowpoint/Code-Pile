@@ -1,17 +1,27 @@
 [build-system]
 requires = [
-  "setuptools",
+  "setuptools >= 65",
+  "flit_core",
+  "wheel",
 ]
-build-backend = "setuptools.build_meta"
+#build-backend = "setuptools.build_meta"
+build-backend = "flit_core.buildapi"
 
 [project]
-name = "Code-Pile"
-version = "0.0.1"
+name = "codepile"
+#version = "0.0.1"
+#description="README.md"
+dynamic = ["version", "description"]
 dependencies = [
     "pydantic",
     "internetarchive",
     "py7zr",
     "more_itertools",
     "pandas",
-    "pyarrow"
+    "pyarrow",
+    "tqdm"
+]
+
+[project.optional-dependencies]
+dev = [
 ]

@@ -19,6 +19,8 @@ import pyarrow.parquet as pq
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
+from time import sleep
+
 from codepile.dataset import DatasetInfo, DatasetSources, RawDataset, Scraper, Processor, Analyser, Dataset
 
 
@@ -60,7 +62,7 @@ class StackExchangeCodeProcessor(Processor):
         # select the tables that we're interested in
         self.target_files = [
                 #'Badges.xml',
-                #'Comments.xml',
+                'Comments.xml',
                 #'PostHistory.xml',
                 #'PostLinks.xml',
                 'Posts.xml',
@@ -71,10 +73,10 @@ class StackExchangeCodeProcessor(Processor):
 
         # key, python type, pyarrow type
         post_types = (
-            ('Id', int, pa.uint32),
+            ('Id', int, pa.int32),
             ('OwnerUserId', int, pa.int32),
             ('ParentId', int, pa.uint32),
-            ('PostTypeId', int, pa.uint8),
+            ('PostTypeId', int, pa.int8),
             ('Score', int, pa.int32), # can be negative
             ('Title', str, pa.large_string),
             ('Body', str, pa.large_string),
@@ -89,13 +91,22 @@ class StackExchangeCodeProcessor(Processor):
             ('Reputation', int, pa.int32),
             ('DisplayName', str, pa.large_string),
             ('Views', int, pa.uint32),
-            ('UpVotes', int, pa.uint32),
-            ('DownVotes', int, pa.uint32),
+            ('UpVotes', int, pa.int32),
+            ('DownVotes', int, pa.int32),
             ('AccountId', int, pa.int32),
             ('ProfileImageUrl', str, pa.large_string),
 
             ('CreationDate', datetime.fromisoformat, pa.date64),
             ('LastAccessDate', datetime.fromisoformat, pa.date64),
+            )
+
+        comment_types = (
+            ('Id', int, pa.int32),
+            ('PostId', int, pa.int32),
+            ('Score', int, pa.int32), # can be negative
+            ('Text', str, pa.large_string),
+            ('UserId', int, pa.int32),
+            ('CreationDate', datetime.fromisoformat, pa.date64),
             )
 
         post_schema = pa.schema([(k,a()) for k,p,a in post_types])
@@ -104,14 +115,19 @@ class StackExchangeCodeProcessor(Processor):
         user_schema = pa.schema([(k,a()) for k,p,a in user_types])
         user_schema_python = {k:p for k,p,a in user_types}
 
+        comment_schema = pa.schema([(k,a()) for k,p,a in comment_types])
+        comment_schema_python = {k:p for k,p,a in comment_types}
+
         self.target_schema_python = {
                 'Users.xml': user_schema_python,
-                'Posts.xml': post_schema_python
+                'Posts.xml': post_schema_python,
+                'Comments.xml': comment_schema_python
                 }
 
         self.target_schema = {
                 'Users.xml': user_schema,
-                'Posts.xml': post_schema
+                'Posts.xml': post_schema,
+                'Comments.xml': comment_schema
                 #'Comments.xml',
                 }
 
@@ -156,6 +172,8 @@ class StackExchangeCodeProcessor(Processor):
         with mp.Pool() as p:
             # extract all the needed dumps
             for domain, dumps in g.items():
+                if domain != 'stackoverflow.com':
+                    continue
                 async_results[domain] = dict()
                 for dump in dumps:
                     if parallel:
@@ -166,6 +184,8 @@ class StackExchangeCodeProcessor(Processor):
 
             # wait 
             for domain in g.keys():
+                if domain != 'stackoverflow.com':
+                    continue
                 # wait until all domain targets are extracted
                 for dump, result in async_results[domain].items():
                     result.wait()
@@ -177,11 +197,15 @@ class StackExchangeCodeProcessor(Processor):
         for domain in g.keys():
              # queue transcoding to intermediate format
             for target in self.target_files:
+                if domain != 'stackoverflow.com':
+                    continue
                 self.save_intermediate(domain, target)
                 gc.collect()
 
         # join tables to dicts
         for domain in g.keys():
+            if domain != 'stackoverflow.com':
+                continue
             # only need to offload the biggest domains
             disk_offload = domain == 'stackoverflow.com'
             # queue transcoding to intermediate format
@@ -237,6 +261,7 @@ class StackExchangeCodeProcessor(Processor):
     def save_intermediate(self, domain: str, target: str):
         output_dirpath = os.path.join(self.config.tmpdir, self.dataset_id, domain)
         target_path = os.path.join(output_dirpath, target.replace('.xml', '.arrow'))
+
         if os.path.isfile(target_path):
             return
 
@@ -289,7 +314,7 @@ class StackExchangeCodeProcessor(Processor):
                     for batch in table.to_batches(max_chunksize=batch_size):
                         writer.write_batch(batch)
 
-        def stream_rows_from_disk(path):
+        def stream_batch_from_disk(path):
             #with pa.memory_map(os.path.join(output_dirpath, 'sorted_answers.arrow'), 'rb') as source:
             with pa.OSFile(path, 'rb') as source:
                 source_stream = pa.ipc.open_file(source)
@@ -299,113 +324,405 @@ class StackExchangeCodeProcessor(Processor):
                         yield row
 
         def stream_rows(table):
-            for batch in table.to_batches():
+            for batch in table.to_batches(max_chunksize=self.batch_size):
                 for row in batch.to_pylist():
                     yield row
 
-        output_dirpath = os.path.join(self.config.tmpdir, self.dataset_id, domain)
             
-        print(f'joining users and posts of {domain}')
-        posts_w_users_path = os.path.join(output_dirpath, 'Posts_w_Users.arrow')
-        if not os.path.isfile(posts_w_users_path):
-            postsds = ds.dataset(os.path.join(output_dirpath, 'Posts.arrow'), format='arrow')
-            usersds = ds.dataset(os.path.join(output_dirpath, 'Users.arrow'), format='arrow')
 
-            # note there are deleted users with a negative userid
-            # todo
-            # remove columns, because they crash pyarrow currently
+        '''
+        # sort the users by their post
+        split posts
+        # answers already have their parentid
+        join post_author with their postid
+        join comment_authors with their commentid
+        join comments with their postid
 
-            # this combination of dataset uses less ram than joining both as tables
-            users_table = ds.dataset(usersds.to_table(columns=['Id', 'Reputation', 'Views', 'UpVotes', 'DownVotes', "AccountId", 'CreationDate']))
-            print(f'joining posts_w_usrs {domain}')
-            posts_w_users = postsds.join(users_table, keys='OwnerUserId', right_keys='Id', left_suffix='post', right_suffix='user').to_table(batch_size=self.batch_size)
+        exporting concept:
+        the target is formatted as a thread document:
 
-            if disk_offload:
-                save_table(posts_w_users, 
-                        posts_w_users_path,
-                        batch_size=self.batch_size)
+        iter questions
+            add question_author 
+            append comments
+                add comment author
+            append answers
+                add aswer author
+                append comments
+                    add comment author
 
-            if disk_offload:
-                del posts_w_users
-            del users_table
-            del usersds
-            gc.collect()
+        therefore we know our key, beeing question['Id']
+        we also know that:
+        question['Id'] < answer['ParentId']
+
+        we need the users alot, so for simplicity, keep the users table
+        as a fast random access datastructure (dict) in memory
+
+        we need comments two times, with separate iterators, 
+        but both with sequential access
+
+        it doesnt make a difference if we iteratively extend, 
+        or group and aggregate the answers and comments
+
+        '''
 
 
-        print('loading users and posts')
-        posts_w_usersds = ds.dataset(posts_w_users_path, format='arrow')
+        output_dirpath = os.path.join(self.config.tmpdir, self.dataset_id, domain)
 
-        is_question = pc.field('PostTypeId') == 1
+        '''
+        def get_tag(output_dirpath):
+
+            posts = postsds.to_table(columns=['Id', 'ParentId', 'OwnerUserId'])
+            users = usersds.to_table(columns=['Id'])
+            comments = commentsds.to_table(columns=['Id','PostId', 'UserId'])
+
+            comments_authors = comments.join(users, keys='UserId', right_keys='Id',
+                    left_suffix='comment', right_suffix='user')
+
+            posts_authors = posts.join(users, keys='OwnerUserId', right_keys='Id',
+                    left_suffix='post', right_suffix='user')
+
+            posts_comments = posts_authors.join(comments_authors, keys='Id', right_keys='PostId',
+                    left_suffix='post', right_suffix='comment')
+
+
+            return posts_comments.sort_by('ParentId')
+
+        tags = get_tag(output_dirpath)
+        '''
+
+
+        postsds = ds.dataset(os.path.join(output_dirpath, 'Posts.arrow'), format='arrow')
+        usersds = ds.dataset(os.path.join(output_dirpath, 'Users.arrow'), format='arrow')
+        commentsds = ds.dataset(os.path.join(output_dirpath, 'Comments.arrow'), format='arrow')
+
+        sorted_questions_path = os.path.join(output_dirpath, 'sorted_Questions.arrow')
+        sorted_answers_path = os.path.join(output_dirpath, 'sorted_Answers.arrow')
+        sorted_comments_path = os.path.join(output_dirpath, 'sorted_Users.arrow')
+        sorted_users_path = os.path.join(output_dirpath, 'sorted_Comments.arrow')
+
+        ## 
+
+        questions = postsds.to_table(filter=is_question)
+        #sorted_questions = questions.sort_by('Id')
+        save_table(sorted_questions, 
+                    sorted_questions_path,
+                    batch_size=self.batch_size)
+        del questions
+        del sorted_questions
+        gc.collect()
+        '''
+        ##
         is_answer = pc.field('PostTypeId') == 2
+        ##
+        answers = postsds.to_table(filter=is_answer)
+        ##
+        '''
+        sorted_answers = answers.sort_by('ParentId')
+        save_table(sorted_answers, 
+                    sorted_answers_path,
+                    batch_size=self.batch_size)
+        del answers
+        del sorted_answers
+        gc.collect()
 
-        # this specific way, we don't have to load the full postsds
-        # the tables still run in memory
-        # because pyarrow doesn't yet support sorting datasets on disk
-        print('loading questions')
-        question_path = os.path.join(output_dirpath, 'sorted_questions.arrow')
-        if not os.path.isfile(question_path) or not disk_offload:
-            question_table = posts_w_usersds.to_table(
-                filter=is_question)
+        comments = commentsds.to_table()
+        sorted_comments = comments.sort_by('PostId')
+        save_table(sorted_comments, 
+                    sorted_comments_path,
+                    batch_size=self.batch_size)
+        del comments
+        del sorted_comments
+        gc.collect()
 
-            print('sorting questions')
-            sorted_questions = question_table.sort_by([('Id', 'ascending')])
-            del question_table
+        # keep users in memory, 
+        # because of many random accesses
+        # group to make lookup easier
+        ##
+        comments = commentsds.to_table()
+        cols = set(comments.column_names)
+        agg = list(zip(list(cols-{'PostId'}), itertools.cycle(['list']))) \
+            + [('PostId','one')]
+        grouped_comments = comments.group_by('PostId').aggregate(agg)
+
+        del comments
+        gc.collect()
+        ##
+
+        batch_size = 1000000
+
+        partitioning = ds.partitioning(
+                pa.schema([
+                    #('PostTypeId', pa.int8()),
+                    ('partition', pa.int64())
+                    ])
+                )
+        ##
+        ass = answers.add_column(len(answers.column_names)-1, pa.field('partition', pa.int64()), [[x//batch_size for x in range(0, answers.num_rows)]])
+        ##
+        is_question = pc.field('PostTypeId') == 1
+
+        ##
+        partitioned_posts = posts.add_column(len(posts.column_names)-1, 
+                pa.field("partition", pa.int64()), 
+                [[x//batch_size for x in range(posts.num_rows)]])
+
+        ##
+        ds.write_dataset(partitioned_posts, 'posts2.arrow', partitioning=partitioning, format='arrow')
+        ##
+        answers = ds.dataset('answers.arrow', format='arrow', partitioning=partitioning)
+        qs = ds.dataset('questions.arrow', format='arrow', partitioning=partitioning)
+        #users = usersds.to_table(columns=[j
+
+        #qs = postsds.scanner(filter=is_question, batch_size=batch_size).to_batches()
+        #qt = pa.Table.from_batches([next(qs)])
+
+        ##
+        ##
+        q_partitions = qs.count_rows()//batch_size
+        a_partitions = answers.count_rows()//batch_size
+        ##
+        postsds = ds.dataset('posts2.arrow', format='arrow', partitioning=partitioning)
+        ##
+
+        # join comments and users
+        # inner join, or the comments would be uselessly replicated
+        # 2 minutes
+        batch_size=1000000
+        joineds = []
+        comments_parts = ceil(comments.num_rows/batch_size)
+
+        for ci in tqdm(range(comments_parts)):
+            #for ui in range(users_parts):
+            ct = comments.slice(ci, batch_size)
+            # join authors to comments
+            ctj = ct.join(users, keys='UserId', right_keys='Id',
+                    left_suffix='comment', right_suffix='user', 
+                    join_type='inner')
+            # join question partition to comments partition
+            joineds.append(ctj)
+            del ct
+            del ctj
             gc.collect()
-            print('saving questions')
+            break
 
-            if disk_offload:
-                save_table(sorted_questions, question_path, self.batch_size)
-                del sorted_questions
+        comments_w_users = pa.concat_tables(joineds)
+
+        ##
+        # join posts with users
+        ##
+        def generate_posts_w_users():
+            batch_size=10000000
+            joineds = []
+            pi = ceil(postsds.count_rows()/batch_size)
+            for p in tqdm(range(pi)):
+                pt = postsds.to_table(filter=ds.field('partition') == p)
+                ptj = pt.join(users, keys='OwnerUserId', right_keys='Id', 
+                        left_suffix='post', right_suffix='user',
+                        join_type='inner')
+                ptjp = ptj.add_column(
+                    len(ptj.column_names)-1, 
+                    pa.field("partition", pa.int64()), 
+                    [[p]*ptj.num_rows]
+                    )
+                #joineds.append(ptj)
+                for b in ptj.to_batches():
+                    yield b
+                del pt
+                del ptj
                 gc.collect()
 
-        print('loading answers')
-        answer_path = os.path.join(output_dirpath, 'sorted_answers.arrow')
-        if not os.path.isfile(answer_path) or not disk_offload:
-            answer_table = posts_w_usersds.to_table(
-                filter=is_answer)
 
-            print('sorting answers')
-            sorted_answers = answer_table.sort_by([('ParentId','ascending')])
-            del answer_table
+        partitioning = ds.partitioning(
+                pa.schema([
+                    #('PostTypeId', pa.int8()),
+                    ('partition', pa.int64())
+                    ])
+                )
+
+        #schem = next(iter(generate_posts_w_users()))
+        ##
+        ds.write_dataset(
+                generate_posts_w_users(),
+                #sc,
+                os.path.join(output_dirpath, 'posts_w_users.arrow'),
+                schema=schem.schema,
+                format='arrow',
+                partitioning=partitioning
+                )
+
+        ##
+        posts_w_users = ds.dataset(os.path.join(output_dirpath, 'posts_w_users.arrow'),
+                format='arrow',
+                partitioning=partitioning)
+
+        #posts_w_users = pa.concat_tables(joineds)
+        ##
+
+        #posts_w_users_w_comments = 
+        joineds = []
+        pp = ceil(posts_w_users.count_rows() / batch_size)
+        for p in tqdm(range(pp)):
+            ppt = posts_w_users.to_table(filter=ds.field('partition') == p)
+            ptj = ppt.join(comments_w_users, keys='Id', right_keys='PostId', 
+                    left_suffix='post', right_suffix='comment',
+                    join_type='inner')
+            #joineds.append(ptj)
+            del ppt
+            #del ptj
             gc.collect()
-            print('saving answers')
 
-            if disk_offload:
-                save_table(sorted_answers, answer_path, self.batch_size)
-                del sorted_answers
+        #posts_w_users_w_comments = pa.concat_tables(joineds)
+        ##
+        questions = posts_w_users_w_comments.filter(is_question)
+        ##
+        answers = posts_w_users_w_comments.filter(is_answer)
+        ##
+        
+
+
+        allq = []
+        for qi in range(q_partitions):
+            ##
+            qt = qs.to_table(filter=ds.field('partition') == qi)
+
+            joineds = []
+            for c in commentsds.to_batches(batch_size=batch_size):
+                ct = pa.Table.from_batches([c])
+                # join authors to comments
+                ctj = ct.join(usersds, keys='UserId', right_keys='Id', 
+                        left_suffix='comment', right_suffix='comment')
+                # join question partition to comments partition
+                joined = qt.join(ctj, keys='Id', right_keys='PostId', 
+                        left_suffix='question', right_suffix='comment', 
+                        join_type='inner')
+                joineds.append(joined)
+                del ct
+                del ctj
                 gc.collect()
 
-        if disk_offload:
-            question_iter = stream_rows_from_disk(question_path)
-            answer_iter = stream_rows_from_disk(answer_path)
-        else:
-            question_iter = stream_rows(sorted_questions)
-            answer_iter = stream_rows(sorted_answers)
+            return
 
-        a = next(answer_iter)
-        appended = 0
+            # combine comments partitions
+            nt = pa.concat_tables(joineds)
+            del joineds
+            gc.collect()
+            #snt = nt.sort_by('Idquestion')
+            # join question authors to questions
+            qc = nt.join(usersds, keys='OwnerUserId', right_keys='Id', 
+                    left_suffix='question', right_suffix='author')
 
+
+            for ai in range(a_partitions):
+                at = answers.to_table(filter=ds.field('partition') == ai)
+
+                joineds = []
+                for c in commentsds.to_batches(batch_size=batch_size):
+                    ct = pa.Table.from_batches([c])
+                    ctj = ct.join(usersds, keys='UserId', right_keys='Id', 
+                            left_suffix='comment', right_suffix='comment')
+                    joined = at.join(ctj, keys='Id', right_keys='PostId', left_suffix='question', right_suffix='comment', join_type='inner')
+                    joineds.append(joined)
+
+                nt = pa.concat_tables(joineds)
+
+                ac = nt.join(usersds, keys='OwnerUserId', right_keys='Id', 
+                        left_suffix='question', right_suffix='author')
+                    
+            ##
+            threads = qc.join(ac, keys='Id', right_keys='ParentId', 
+                    left_suffix='question', right_suffix='answer')
+                
+            allq.append(threads)
+                
+
+
+            del qt
+            del nt
+            del ct
+            del joined
+            del joineds
+            gc.collect()
+        ##
+
+        users = usersds.to_table()
+
+        # now iteratively join all the tables
+        iters = dict()
+
+        iters['questions'] = stream_rows_from_disk(sorted_questions_path)
+        #iters['question_comments'] = stream_rows_from_disk(sorted_comments_path)
+
+        iters['answers'] = stream_rows_from_disk(sorted_answers_path)
+        #iters['answer_comments'] = stream_rows_from_disk(sorted_comments_path)
+
+        #a = next(answer_iter)
+        #c = next(comment_iter)
+        def get_user(user_id):
+            user_pos = users['Id'].index(user_id).as_py()
+            if user_pos != -1:
+                 return users.take([user_pos]).to_pylist()[0]
+            else:
+                return {'unk'}
+
+        def get_comments(post_id):
+            comment_group_id = grouped_comments['PostId'].index(post_id).as_py()
+            if comment_group_id != -1:
+                 cols = grouped_comments.take([comment_group_id])
+                 #return [cols[k][i] for k in cols.itercolumns
+                 #print(cols.to_pylist())
+                 cols.to_pydict()
+                 return cols.to_pylist()
+            else:
+                return []
+
+        for question in tqdm(iter['questions'])
+            
         print(f'iterating: {domain}')
-        for q in tqdm(question_iter):
-            result = dict()
-            result['question'] = q
-            result['answers'] = []
-            #print(q['Id'])
-            while 1:
-                assert q['Id'] <= a['ParentId'], f'question id not smaller than answer parent id, something broke, question: {q} \nanswer: {a} '
-                if q['Id'] == a['ParentId']:
-                    result['answers'] = result['answers'] + [a]
-                    appended += 1
-                    try:
-                        a = next(answer_iter)
-                    except StopIteration:
-                        return
-                else:
-                    break
+        # join question and answers iteratively, to save ram
+        for question in tqdm(iters['questions']):
+            # add author to the question
+            question['Author'] = get_user(question['OwnerUserId'])
 
-            #formatted = self.format(result)
-            #self.save_to_jsonl(formatted)
-            #print(appended)
+            # add the comments to the question
+            question_comments = get_comments(
+                    question['Id'])
+
+
+            # add the authors to the question comments
+            for i, c in enumerate(question_comments):
+                print(c)
+                question_comments[i]['Author'] = get_user(c['UserId_list'])
+
+
+            # skip until the next related question answers
+            itertools.takewhile(
+                    lambda a: a['ParentId']<question['Id'],
+                    iters['answers']
+                )
+            # collect the answers to the question
+            answers = list(itertools.takewhile(
+                    lambda a: a['ParentId']==question['Id'],
+                    iters['answers']
+                ))
+
+            for i,a in enumerate(answers):
+                # add authors to the answers
+                answers[i]['Author'] = get_user(a['OwnerUserId'])
+
+                # add the comments to the answers
+                answer_comments = get_comments(
+                        a['Id']
+                        )
+                # add authors to the comments of the answers
+                for j, c in enumerate(answer_comments):
+                    answer_comments[j]['Author'] = get_user(c['UserId_list'])
+
+            thread = dict()
+            thread['question'] = question
+            thread['answers'] = answers
+            print(thread)
+            sleep(2)
+            '''
 
 
 class StackExchangeDataset(Dataset):
@@ -432,8 +749,8 @@ class StackExchangeDataset(Dataset):
         STACKEXCHANGEINFO = DatasetInfo(
                 id='StackExchange',
                 description=description,
-                data_end=datetime(2022,06,06),
-                data_start=datetime(2014,01,21),
+                data_end=datetime(2022,6,6),
+                data_start=datetime(2014,1,21),
                 size=-1,
                 storage_format='.jsonl.zst',
                 #storage_uri='/root',
@@ -448,7 +765,7 @@ class StackExchangeDataset(Dataset):
                 dataset_cons='',
                 languages=[''],
                 coding_languages=[''],
-                modalities=['question/answer'],
+                modalities=['discussion'],
                 source_license='CC BY-SA 4.0',
                 source_citation='',
                 data_owner='flowpoint',
